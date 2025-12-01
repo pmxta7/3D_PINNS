@@ -1,0 +1,352 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import scipy.special
+import time
+# ==========================================================================================================================================
+# GETTING MESH
+# ==========================================================================================================================================
+FACES = np.loadtxt("faces.csv",delimiter=",") # faces
+VERTICES = np.loadtxt("vertices.csv",delimiter=",") # vertices
+# ==========================================================================================================================================
+# DATA ON MESH
+# ==========================================================================================================================================
+data = np.loadtxt("data.csv",delimiter=",") # data
+data = np.array([0 if -.7 <= x <= .7 else x for x in data]) # thresholded at .7
+# =========================================================================================================================================
+# SETTING UP SIMULATION
+# =========================================================================================================================================
+N_sim = 1 # Number of simulations
+
+# data_sim = []
+# test_points_sim = []
+# test_values_sim = []
+# RMSE_orig = []
+# RMSE_vertex = []
+# RMSE_notvertex = []
+
+for i in range(N_sim):
+#     # =========================================================================================================================================
+#     # ADDING NOISE
+#     # =========================================================================================================================================
+#     sigma = 0.5*np.std(signal)
+
+#     np.random.seed(1)
+#     noise = np.random.normal(loc=0,scale=sigma,size=VERTICES.shape[0])
+
+#     data = signal + noise
+    # =========================================================================================================================================
+    # SETTING UP DATASET
+    # =========================================================================================================================================
+    # Write dataset as tensor
+    points = torch.Tensor(VERTICES)
+    faces = torch.Tensor(FACES).long()
+    values = torch.Tensor(data).reshape(-1,1)
+
+    pav = torch.cat((points,values),1)
+    faces = pav[faces,:]
+
+#     sig = torch.Tensor(signal)
+
+    # Creating batches
+    N_batch = 5
+    batch_size_faces = int(faces.shape[0]/N_batch)
+    batch_size_pav = int(pav.shape[0]/N_batch)
+
+    faces_loader = DataLoader(faces, batch_size_faces, shuffle=True)
+    pav_loader = DataLoader(pav, batch_size_pav, shuffle=True)
+    # =========================================================================================================================================
+    # SETTING UP NEURAL NETWORK 
+    # =========================================================================================================================================
+    # Build neural network
+    class PINN(nn.Module):
+        def __init__(self, N_layers, in_size, hidden_size, out_size):
+            super().__init__()
+            # hidden layer
+            self.linear1 = nn.Linear(in_size, hidden_size)
+            self.linears = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for i in range(N_layers-1)])
+            # output layer
+            self.linear2 = nn.Linear(hidden_size, out_size)
+            torch.nn.init.xavier_uniform_(self.linear1.weight)
+            for i in range(N_layers-1):
+                torch.nn.init.xavier_uniform_(self.linears[i].weight)
+            torch.nn.init.xavier_uniform_(self.linear2.weight)
+
+        def forward(self, xb, GCV=False):
+            # Get intermediate outputs using hidden layer
+            out = self.linear1(xb)
+            # Apply activation function
+            out = torch.tanh(out)#F.softplus(out)
+            for i, l in enumerate(self.linears):
+                out = self.linears[i](out)
+                out = torch.tanh(out)#F.softplus(out)
+            # Get predictions using output layer
+            if GCV == False:
+                out = self.linear2(out)
+            return out
+    # ==========================================================================================================================================
+    # CHOOSING ARCHITECTURE
+    # ==========================================================================================================================================
+    N_layers = 4
+    input_size = 3
+    hidden_size = 50
+    output_size = 1
+    # ==========================================================================================================================================
+    # INSTATIATING NEURAL NETWORKS
+    # ==========================================================================================================================================
+    model_f = PINN(N_layers,input_size, hidden_size, out_size=output_size)
+    model_g = PINN(N_layers,input_size, hidden_size, out_size=output_size)
+    # ==========================================================================================================================================
+    # USEFUL MATHEMATICAL FUNCTIONS + LOSS
+    # ==========================================================================================================================================
+    # Useful mathematical functions - optimized
+    def w(face,p): # test function (adapted from article)
+        u, v = p
+        return torch.tile(256*((u-1/2)**2-1/4)**2*((v-1/2)**2-1/4)**2,(face.shape[0],1)) # Number of faces X Number of points in (u,v)-space
+
+    def LBO_w(face,p): # Laplace-Beltrami operator of test function w(u, v) for any face in the mesh
+        r1 = face[:,0,:-1]
+        r2 = face[:,1,:-1]
+        r3 = face[:,2,:-1]
+        u, v = p
+        A = torch.tile(torch.sum((r2-r1)*(r2-r1),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0])) #Broadcasting
+        B = torch.tile(torch.sum((r3-r2)*(r3-r2),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0]))
+        C = torch.tile(torch.sum((r3-r2)*(r2-r1),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0]))
+        num = A*(6*u**2-6*u+1)*(v-1)**2 + C*2*u*(v-1)*(-4*u**2+3*u+3*u*v-2*v) + B*u**2*(3*u**2-2*u**2*v+v**2-2*u)
+        den = A*B-C**2
+        return 256*2*num/den # Number of faces X Number of points in (u,v)-space
+
+    def det(face,p): # determinant of induced metric on any face
+        r1 = face[:,0,:-1]
+        r2 = face[:,1,:-1]
+        r3 = face[:,2,:-1]
+        u, v = p
+        A = torch.tile(torch.sum((r2-r1)*(r2-r1),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0])) #Broadcasting
+        B = torch.tile(torch.sum((r3-r2)*(r3-r2),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0]))
+        C = torch.tile(torch.sum((r3-r2)*(r2-r1),dim=1).reshape(1,r1.shape[0]).T,(1,u.shape[0]))
+        return v**2*(A*B-C**2) # Number of faces X Number of points in (u,v)-space
+
+    def embedding(face,p): # embedding of face into 3D
+        r1 = face[:,0,:-1]
+        r2 = face[:,1,:-1]
+        r3 = face[:,2,:-1]
+        u, v = p
+        u = torch.tile(u,(r1.shape[0],3,1))
+        v = torch.tile(v,(r1.shape[0],3,1))
+        r1 = torch.unsqueeze(r1,-1).repeat(1,1,u.shape[-1])
+        r2 = torch.unsqueeze(r2,-1).repeat(1,1,u.shape[-1])
+        r3 = torch.unsqueeze(r3,-1).repeat(1,1,u.shape[-1])
+        return torch.transpose((1-u)*(r1+v*(r2-r1))+u*(r1+v*(r3-r1)),1,2) # Number of faces X Number of points in (u,v)-space X 3
+
+    def GaussLegendre(face,func,NN): # Numerical integration
+        X, W = scipy.special.roots_legendre(5) # Number of quadrature points in each dimension
+        X = torch.Tensor(X) # quadrature points
+        W = torch.Tensor(W) # weights
+        u = (X + 1)/2
+        v = (X + 1)/2
+        p = torch.Tensor([[i,j] for i in u for j in v]).T # quadrature points in (u,v)-space
+        WW = torch.tile(torch.Tensor([i*j for i in W for j in W]),(face.shape[0],1))
+        func_vec = func(face,p)
+        NN_vec  = NN.forward(embedding(face,p)).flatten(start_dim=-2,end_dim=-1)
+        det_vec = torch.sqrt(det(face,p))
+        return torch.sum(func_vec*NN_vec*det_vec*WW*1/4,dim=1) # Number of faces
+
+    # Loss functions
+    def PINN_data_loss(pav, faces, model_f, model_g): # Loss function (same notation as article) 
+        Rdata = F.mse_loss(torch.flatten(model_f.forward(pav[:,:-1])),pav[:,-1])
+        return Rdata 
+
+    def PINN_PDE_loss(pav, faces, model_f, model_g): # Loss function (same notation as article)
+        s1 = GaussLegendre(faces,LBO_w,model_g)**2
+        s23 = (GaussLegendre(faces,LBO_w,model_f) - GaussLegendre(faces,w,model_g))**2
+        return torch.sum(s1 + s23)/faces.shape[0]
+    # =========================================================================================================================================
+    # TRAINING FUNCTIONS
+    # =========================================================================================================================================
+    def fit_batch(epochs, lr1, hp, pav_loader, faces_loader, model_f, model_g, opt_func=torch.optim.Adam): # Without Lagrangian duality, using batches
+        """Train the model using gradient descent"""
+        history = []
+        PINN_data_vec = []
+        PINN_PDE_vec = []
+#         val = []
+        optimizer = opt_func(list(model_f.parameters()) + list(model_g.parameters()))
+        for epoch in range(epochs):
+            b = 0
+            history_b = []
+            PINN_data_vec_b = []
+            PINN_PDE_vec_b = []
+#             val_b = []
+            for idx, datum in enumerate(zip(pav_loader, faces_loader)):
+                pav = datum[0]
+                faces = datum[1]
+                # Training Phase 
+                PINN_data = PINN_data_loss(pav, faces, model_f, model_g)
+                PINN_PDE = PINN_PDE_loss(pav, faces, model_f, model_g)
+                loss = PINN_data + hp*PINN_PDE
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                history_b.append(loss.item())
+                PINN_data_vec_b.append(PINN_data.item())
+                PINN_PDE_vec_b.append(PINN_PDE.item())
+                learn_res = model_f.forward(points).flatten()
+#                 val_b.append(F.mse_loss(learn_res,sig).item())
+                b = b + 1
+            history.append(np.mean(np.array(history_b)))
+            PINN_data_vec.append(np.mean(np.array(PINN_data_vec_b)))
+            PINN_PDE_vec.append(np.mean(np.array(PINN_PDE_vec_b)))
+#             val.append(np.mean(np.array(val_b)))
+        return history, PINN_data_vec, PINN_PDE_vec#, val
+
+    def fit_batch_2(epochs, lr1, hp, pav, faces, model_f, model_g, opt_func=torch.optim.LBFGS): # Without Lagrangian duality, using batches, using L-BFGS
+        """Train the model using gradient descent"""
+        history = []
+        PINN_data_vec = []
+        PINN_PDE_vec = []
+#         val = []
+        optimizer = opt_func(list(model_f.parameters()) + list(model_g.parameters()))
+        for epoch in range(epochs):
+            # Training Phase 
+            PINN_data = PINN_data_loss(pav, faces, model_f, model_g)
+            PINN_PDE = PINN_PDE_loss(pav, faces, model_f, model_g)
+            loss = PINN_data + hp*PINN_PDE
+            def closure():
+                optimizer.zero_grad()
+                PINN_data = PINN_data_loss(pav, faces, model_f, model_g)
+                PINN_PDE = PINN_PDE_loss(pav, faces, model_f, model_g)
+                loss = PINN_data + hp*PINN_PDE
+                loss.backward()
+                return loss
+            optimizer.step(closure)
+            history.append(loss.item())
+            PINN_data_vec.append(PINN_data.item())
+            PINN_PDE_vec.append(PINN_PDE.item())
+            learn_res = model_f.forward(points).flatten()
+#             val.append(F.mse_loss(learn_res,sig).item())
+        return history, PINN_data_vec, PINN_PDE_vec#, val
+    # =========================================================================================================================================
+    # TRAINING PINN
+    # =========================================================================================================================================
+    # Training the PINN - No Lagrangian duality
+    t0 = time.time()
+
+    history = []
+    PINN_data_vec = []
+    PINN_PDE_vec = []
+#     val = []
+
+    N_epoch = 10000
+    lr1 = 0.05
+    hp = 10**(1)
+
+    history, PINN_data_vec, PINN_PDE_vec = fit_batch(N_epoch, lr1, hp, pav_loader, faces_loader, model_f, model_g)
+
+    print("Adam optimization (s) = ", time.time()-t0)
+
+    # Training the PINN - No Lagrangian duality - L-BFGS
+    t0 = time.time()
+
+    history2 = []
+    PINN_data_vec2 = []
+    PINN_PDE_vec2 = []
+#     val2 = []
+
+    N_epoch = 100
+
+    history2, PINN_data_vec2, PINN_PDE_vec2 = fit_batch_2(N_epoch, lr1, hp, pav, faces, model_f, model_g)
+
+    print("L-BFGS optimization (s) = ", time.time()-t0)
+
+    history.extend(history2)
+    PINN_data_vec.extend(PINN_data_vec2)
+    PINN_PDE_vec.extend(PINN_PDE_vec2)
+#     val.extend(val2)
+#     # =========================================================================================================================================
+#     # SETTING UP "TEST SET"
+#     # =========================================================================================================================================
+#     # Generating test points 
+#     np_triangle = 1
+#     random_seed = 1
+#     torch.manual_seed(random_seed)
+#     torch.cuda.manual_seed(random_seed)
+#     torch.backends.cudnn.deterministic = True
+#     torch.backends.cudnn.benchmark = False
+#     np.random.seed(random_seed)
+#     test_points_uv = torch.rand(np_triangle,2)
+#     test_points = embedding(faces,test_points_uv.T).reshape(np_triangle*faces.shape[0],3)
+
+#     # Calculating signal at test points
+#     test_value = np.prod(np.cos(np.pi*(-test_points.numpy() + p_min)/(p_min - p_max)),axis=1)
+#     # =========================================================================================================================================
+#     # GETTING RESULTS
+#     # =========================================================================================================================================
+#     VALUE = model_f.forward(pav[:,:-1]).reshape(VERTICES.shape[0]).detach().numpy()
+
+#     error1 = (VALUE.flatten() - signal)
+#     error2 = (model_f.forward(test_points).reshape(test_value.shape[0]).detach().numpy().flatten() - test_value)
+    
+#     data_sim.append(data)
+#     test_points_sim.append(test_points.flatten().numpy())
+#     test_values_sim.append(test_value)
+#     RMSE_orig.append(np.sqrt(np.mean((data-signal)**2)))
+#     RMSE_vertex.append(np.sqrt(np.mean(error1**2)))
+#     RMSE_notvertex.append(np.sqrt(np.mean(error2**2)))
+# # =========================================================================================================================================
+# # SAVING RESULTS
+# # =========================================================================================================================================
+# np.savetxt("data_sim.csv",data_sim,delimiter=",")
+# np.savetxt("test_points_sim.csv",test_points_sim,delimiter=",")
+# np.savetxt("test_values_sim.csv",test_values_sim,delimiter=",")
+# np.savetxt("RMSE_orig.csv",RMSE_orig,delimiter=",")
+# np.savetxt("RMSE_vertex.csv",RMSE_vertex,delimiter=",")
+# np.savetxt("RMSE_notvertex.csv",RMSE_notvertex,delimiter=",")
+# =========================================================================================================================================
+# COMPUTING GCV (SEE NOTES)
+# =========================================================================================================================================
+def GaussLegendreGCV(face,func,NN): # Slightly modified Gauss-Legendre that deals with vector functions (instead of scalars)
+    X, W = scipy.special.roots_legendre(5) # Number of quadrature points in each dimension
+    X = torch.Tensor(X) # quadrature points
+    W = torch.Tensor(W) # weights
+    u = (X + 1)/2
+    v = (X + 1)/2
+    p = torch.Tensor([[i,j] for i in u for j in v]).T # quadrature points in (u,v)-space
+    WW = torch.tile(torch.Tensor([i*j for i in W for j in W]),(face.shape[0],1))
+    func_vec = func(face,p)
+    NN_vec  = NN.forward(embedding(face,p),GCV=True)
+    NN_vec = torch.cat((NN_vec,torch.ones(faces.shape[0],X.shape[0]**2,1)),-1)
+    det_vec = torch.sqrt(det(face,p))
+    func_vec = torch.tile(func_vec,(hidden_size + 1,1,1)).permute(1,2,0) # Broadcasting
+    det_vec = torch.tile(det_vec,(hidden_size + 1,1,1)).permute(1,2,0)
+    WW = torch.tile(WW,(hidden_size + 1,1,1)).permute(1,2,0)
+    return torch.sum(func_vec*NN_vec*det_vec*WW*1/4,dim=1) # Number of faces X Number of neurons in the last hidden layer + 1
+
+def Mprod(vec): # Matrix multiplication
+    P = vec[0]
+    i = 1
+    while i < len(vec):
+        P = torch.mm(P,vec[i])
+        i = i + 1
+    return P
+
+# Auxiliary matrices
+M1 = torch.cat((model_f.forward(pav[:,:3],GCV=True).T,torch.ones(1,VERTICES.shape[0])),0).T
+M2 = GaussLegendreGCV(faces,LBO_w,model_g)
+M3 = GaussLegendreGCV(faces,LBO_w,model_f)
+M4 = GaussLegendreGCV(faces,w,model_g)
+
+M5 = Mprod([Mprod([M2.T,M2]) + Mprod([M4.T,M4]),1/VERTICES.shape[0]*Mprod([M1.T,M1])+hp/faces.shape[0]*Mprod([M3.T,M3])])-hp/faces.shape[0]*Mprod([M4.T,M3,M3.T,M4])
+A = Mprod([torch.linalg.inv(M5),Mprod([M2.T,M2]) + Mprod([M4.T,M4])])
+
+H = 1/VERTICES.shape[0]*Mprod([M1,A,M1.T])
+
+# Effective degrees of freedom
+k = torch.trace(H)
+
+# GCV
+gcv = 1/(1-k/VERTICES.shape[0])**2*F.mse_loss(torch.flatten(model_f.forward(pav[:,:-1])),pav[:,-1])
+
+np.savetxt("gcv.csv",np.array([gcv.item()]),delimiter=",")
+torch.save(model_f.state_dict(), "model_f.pt")
+torch.save(model_g.state_dict(), "model_g.pt")
