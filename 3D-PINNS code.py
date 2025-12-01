@@ -350,3 +350,4 @@ gcv = 1/(1-k/VERTICES.shape[0])**2*F.mse_loss(torch.flatten(model_f.forward(pav[
 np.savetxt("gcv.csv",np.array([gcv.item()]),delimiter=",")
 torch.save(model_f.state_dict(), "model_f.pt")
 torch.save(model_g.state_dict(), "model_g.pt")
+
